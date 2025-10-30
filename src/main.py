@@ -35,12 +35,8 @@ class Lead(BaseModel):
 
 class LeadPersonalization(BaseModel):
     id: str
-    name: str
-    owner: str
+    phone: str
     dm_opener: str
-    call_script: str | None = None
-    email_opener: str | None = None
-    notes: str | None = None
 
 
 class PersonalizedMessage(BaseModel):
@@ -130,12 +126,28 @@ class SheetsManager:
             for row in data_rows
         ]
 
+    def get_processed_lead_ids(self) -> set[str]:
+        worksheet = self.client.open_by_key(self.sheet_id).worksheet("outreach_personalisation")
+        all_values = worksheet.get_all_values()
+
+        if not all_values or len(all_values) < 2:
+            return set()
+
+        headers = all_values[0]
+        id_col = next((i for i, h in enumerate(headers) if h.lower() == "id"), 0)
+
+        return {
+            row[id_col]
+            for row in all_values[1:]
+            if row and len(row) > id_col and row[id_col]
+        }
+
     def write_personalization(self, personalization: LeadPersonalization) -> None:
         worksheet = self.client.open_by_key(self.sheet_id).worksheet("outreach_personalisation")
         all_values = worksheet.get_all_values()
 
         if not all_values:
-            headers = ["ID", "Name", "Owner", "DM opener", "Call Script", "Email Opener", "Notes"]
+            headers = ["ID", "Phone", "DM opener"]
             worksheet.append_row(headers)
             all_values = [headers]
 
@@ -150,12 +162,8 @@ class SheetsManager:
 
         row_data = [
             personalization.id,
-            personalization.name,
-            personalization.owner,
+            personalization.phone,
             personalization.dm_opener,
-            personalization.call_script or "",
-            personalization.email_opener or "",
-            personalization.notes or "",
         ]
 
         if existing_row:
@@ -233,18 +241,30 @@ class LeadProcessor:
         if enriched_lead.id:
             self.sheets_manager.write_personalization(LeadPersonalization(
                 id=enriched_lead.id,
-                name=enriched_lead.business or "Unknown",
-                owner=enriched_lead.owner_name or "",
+                phone=enriched_lead.phone or "",
                 dm_opener=personalized_message.dm_opener,
             ))
 
-    async def process_multiple_leads(self, max_leads: int = 5) -> None:
+    async def process_multiple_leads(self, max_leads: int | None = None) -> None:
+        processed_ids = self.sheets_manager.get_processed_lead_ids()
+
         leads = self.sheets_manager.read_leads()
 
         if not leads:
             raise ValueError("No leads found in Google Sheets")
 
-        for lead in leads[:max_leads]:
+        unprocessed_leads = [lead for lead in leads if lead.id and lead.id not in processed_ids]
+
+        if not unprocessed_leads:
+            self.logger.info("No new leads to process, all leads have already been personalized")
+            return
+
+        leads_to_process = unprocessed_leads if max_leads is None else unprocessed_leads[:max_leads]
+
+        self.logger.info(f"Found {len(unprocessed_leads)} unprocessed leads out of {len(leads)} total leads")
+        self.logger.info(f"Processing {len(leads_to_process)} leads")
+
+        for lead in leads_to_process:
             await self.process_lead(lead)
 
 
@@ -254,7 +274,7 @@ def main() -> None:
     logging.getLogger("apify").setLevel(logging.WARNING)
 
     try:
-        asyncio.run(LeadProcessor(Config()).process_multiple_leads(max_leads=5))
+        asyncio.run(LeadProcessor(Config()).process_multiple_leads())
     except Exception as e:
         logging.getLogger(__name__).exception(f"Application failed with error: {e}")
         raise
