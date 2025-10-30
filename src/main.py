@@ -2,12 +2,14 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+from typing import TypeVar
 
 import gspread
+import pandas as pd
 from apify_client import ApifyClient
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
@@ -52,6 +54,43 @@ class Review(BaseModel):
     title: str | None = None
     name: str | None = None
     text: str | None = None
+
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class CSVLoader:
+    @staticmethod
+    def load_csv(file_path: Path | str, model: type[T], lowercase_columns: bool = True) -> list[T]:
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+
+        if not file_path.exists():
+            raise FileNotFoundError(f"CSV file not found: {file_path}")
+
+        dataframe = pd.read_csv(file_path, dtype=str)
+
+        dataframe = dataframe.fillna("")
+
+        if lowercase_columns:
+            dataframe.columns = [col.lower() for col in dataframe.columns]
+
+        validated_records: list[T] = []
+        errors: list[tuple[int, str]] = []
+
+        for index, row in dataframe.iterrows():
+            try:
+                record_dict = row.to_dict()
+                validated_record = model(**record_dict)
+                validated_records.append(validated_record)
+            except ValidationError as error:
+                errors.append((int(index) + 2, str(error)))
+
+        if errors:
+            error_messages = [f"Row {row_num}: {msg}" for row_num, msg in errors]
+            raise ValueError(f"Validation errors in CSV:\n" + "\n".join(error_messages))
+
+        return validated_records
 
 
 class Config:
@@ -121,10 +160,18 @@ class SheetsManager:
 
         headers, *data_rows = all_values
 
-        return [
-            Lead(**{headers[i].lower(): (row[i] if i < len(row) and row[i] else None) for i in range(len(headers))})
-            for row in data_rows
-        ]
+        dataframe = pd.DataFrame(data_rows, columns=[h.lower() for h in headers])
+        dataframe = dataframe.replace("", None)
+
+        validated_leads: list[Lead] = []
+        for _, row in dataframe.iterrows():
+            try:
+                lead = Lead(**row.to_dict())
+                validated_leads.append(lead)
+            except ValidationError as error:
+                logging.getLogger(__name__).warning(f"Skipping invalid lead: {error}")
+
+        return validated_leads
 
     def get_processed_lead_ids(self) -> set[str]:
         worksheet = self.client.open_by_key(self.sheet_id).worksheet("outreach_personalisation")
@@ -133,14 +180,14 @@ class SheetsManager:
         if not all_values or len(all_values) < 2:
             return set()
 
-        headers = all_values[0]
-        id_col = next((i for i, h in enumerate(headers) if h.lower() == "id"), 0)
+        headers, *data_rows = all_values
 
-        return {
-            row[id_col]
-            for row in all_values[1:]
-            if row and len(row) > id_col and row[id_col]
-        }
+        dataframe = pd.DataFrame(data_rows, columns=[h.lower() for h in headers])
+
+        if "id" not in dataframe.columns:
+            return set()
+
+        return set(dataframe["id"].dropna().astype(str))
 
     def write_personalization(self, personalization: LeadPersonalization) -> None:
         worksheet = self.client.open_by_key(self.sheet_id).worksheet("outreach_personalisation")

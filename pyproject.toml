@@ -16,6 +16,7 @@ dependencies = [
     "google-auth>=2.42.0",
     "gspread>=6.2.1",
     "apify-client>=1.0.0",
+    "pandas>=2.0.0",
 ]
 requires-python = ">=3.10"
 readme = "README.md"
